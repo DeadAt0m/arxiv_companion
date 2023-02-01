@@ -78,24 +78,23 @@ class ArxivArxiv(object):
         papers_meta = []
         for _id in tqdm.tqdm(id_list):
             try:
-                temp = arxiv.query(id_list = [_id])
-                #               if len(temp) > 1:
-# 			        print('[Debug] Strange query: ',temp)
+                temp = list(arxiv.Search(id_list = [_id]).results())
                 papers_meta.append(temp[0])
-            except:
+            except Exception as e:
+                 print(e)
                  print(_id)
      
         print('Something went wrong during queries. {0}% of articles is missing'.format(int(100*(1-len(papers_meta)/len(id_list)))))
         print('[Debug] ID_list length: {0}, Query length: {1}'.format(len(id_list),len(papers_meta)))
-        print(f'Queried: {list(map(lambda x: x["id"].split("/")[-1],papers_meta))}\nFull: {id_list}')
+        print(f'Queried: {list(map(lambda x: x.entry_id.split("/")[-1],papers_meta))}\nFull: {id_list}')
         print('Adding to exiting database...', end=' ')
         local_db = {}
         for idx,meta_info in enumerate(papers_meta):
             temp_dict = {}
-            temp_dict['authors'] = meta_info['authors']
+            temp_dict['authors'] = list(map(str, meta_info.authors))
             temp_dict['title'] = self._correct_article_title(meta_info)
-            temp_dict['pdf_url'] = meta_info['pdf_url']
-            temp_dict['date'] = meta_info['published_parsed']
+            temp_dict['pdf_url'] = meta_info.pdf_url
+            temp_dict['date'] = meta_info.published
             local_db[id_list[idx]] = temp_dict
         self.db = {**self.db, **local_db}
         print('Done.')
@@ -114,7 +113,7 @@ class ArxivArxiv(object):
         print('Database was saved in ',self.db_path)
 
     def _correct_article_title(self,query):
-        title = query['title']
+        title = query.title
         title = title.replace(':', '.')
         title = title.replace('\t', ' ')
         title = title.replace('\n', '')
@@ -197,6 +196,10 @@ class ArxivArxiv(object):
                     print('Something went wrong during downloading {0} by url {1}. Passed'.format(elem['title'],
                                                                                           elem['pdf_url']))    
             print('Download finished!')
+
+            
+            
+
 
             
             
