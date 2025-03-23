@@ -1,0 +1,8 @@
+channels:
+   - conda-forge
+dependenices:
+   - python==3.11
+   - click
+   - tqdm
+   - arxiv
+   - dataclass_wizard

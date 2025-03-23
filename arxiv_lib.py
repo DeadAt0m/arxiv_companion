@@ -1,205 +1,299 @@
-import os
-import arxiv
+import csv
 import pickle
-import time
-import tqdm
-import random
 import re
-#pip install python-Levenshtein
-from Levenshtein import distance
+import click 
+from tqdm.auto import tqdm 
+from itertools import islice
+from arxiv import Client, Search, Result, SortCriterion, SortOrder
+from pathlib import Path
+from functools import lru_cache
+from collections.abc import Iterator, Iterable, Callable
+from typing import Pattern, Match, Self, Any
+from datetime import datetime
+from urllib.request import urlretrieve
+from dataclasses import dataclass, field
+from dataclass_wizard import Container, JSONListWizard, JSONFileWizard
 
+###################     UTILS     ###################################
+THISPATH = Path(__file__).parent
 
+def list_chunk(x: list, size: int) -> Iterator[list]:
+    it: Iterator[Any] = iter(x)
+    return iter(lambda: list(islice(it, size)), list())
 
+def _mb_int(x: str | None) -> int | None:
+            if x is None: return None
+            return int(x)
+
+def _pretty_authors_str(authors: tuple[str, ...]) -> str:
+    n_authors: int = len(authors)
+    authors: tuple[str, ...] = authors[:3]
+    def _standartize_author(author: str) -> str:
+        parts: list[str] = author.split(' ')
+        surname: str = parts[-1].capitalize()
+        first_capital_letter: str = parts[0][0].upper()
+        return f'{surname}, {first_capital_letter}.'
+    authors = tuple(map(_standartize_author, authors))
+    if n_authors > 3: authors = authors + ('etc.', )
+    return ', '.join(authors)
+#####################################################################
+###################     STRUCTURES     ##############################
+@dataclass(frozen=True)
+class PrePrint(JSONListWizard, JSONFileWizard):
+    aid: str
+    authors: tuple[str, ...]
+    title: str
+    url: str
+    summary: str
+    published: datetime
+    version: int | None = None
+
+    @classmethod
+    @property
+    @lru_cache(1)
+    def id_pattern(cls) -> Pattern:
+        return re.compile(r".*\[?(?P<id>\d{4}\.\d{5})(?:v(?P<ver>\d{1,}))?\]?.*")
+
+    @classmethod
+    def from_arxiv_result(cls, r: Result) -> Self:
+        parsed_id: Match = cls.id_pattern.fullmatch(r.entry_id)
+        return cls(aid=parsed_id.group('id'),
+                   authors=tuple(map(lambda a: a.name, r.authors)),
+                   title=r.title,
+                   url=r.pdf_url,
+                   summary=r.summary,
+                   published=r.published,
+                   version=_mb_int(parsed_id.group('ver')))
     
-class ArxivArxiv(object):
-    def __init__(self,path='./arxiv_local/arxiv.db'):
-        self.reload_database(path)
-        self.set_download_path()
-        
-    def _check_db_existence(self,path):
-        res = os.path.exists(path)
-        self.empty_db_flag = not res
-        if res:
-            try:
-                db_file = open(path, 'rb')
-                self.db = pickle.load(db_file)
-                db_file.close()
-                print('Database load successefuly from ',path,' and contains {0} elements'.format(len(self.db)))
-            except:
-                print('Something went wrong during database load.',
-                      'Local database assumed empty.',
-                      'Please reload or import from file.')     
-        else:
-            print(path,' does not exists!')
-            
-    def reload_database(self,path):
-        self.db_path = path
-        self.db = {}
-        self.empty_db_flag = True
-        self._check_db_existence(path)
-        
-        
-        
-    def set_download_path(self,path='./arxiv_local/downloads'):
-        os.makedirs(path, exist_ok=True)
-        self.download_path = path if path[-1] == '/' else path+'/'
-        print('Download path set to ',self.download_path)
-        
-    def import_from_file(self,path):
-        def extract_id_from_string(str_):
-            find_url_start = str_.find('href=') + 6
-            find_url_end = str_.find(' ',find_url_start) - 1
-            url = str_[find_url_start:find_url_end]
-            id_start = url.rfind('/') + 1
-            return url[id_start:]
-        def _check_id(str_):
-            r = re.compile('([0-9]{4})\.([0-9]{5,7})')
-            return bool(r.match(str_)) 
-        
-        if not os.path.exists(path):
-            print('File {0} does not exists'.format(path))
-        else:
-            html_list = []
-            with open(path) as fin:
-                for line in fin:
-                    if not 'bioarxiv' in line and 'arxiv' in line:
-                        html_list.append(line)
-            id_list = [extract_id_from_string(s) for s in html_list if s.find('href=') > -1 and _check_id(extract_id_from_string(s))]          
-            print('File {0} successefuly loaded.'.format(path))
-            id_list = list(set(id_list) - set(self.db.keys()))            
-            self._add_to_db(id_list)
-            
-    def import_from_id_list(self,id_list):
-        if id_list:
-            self._add_to_db(id_list)
-            
-    def _add_to_db(self, id_list):
-        print(f'Make {len(id_list)} queries to arxiv.org. Can take a while...')
-        papers_meta = []
-        for _id in tqdm.tqdm(id_list):
-            try:
-                temp = list(arxiv.Search(id_list = [_id]).results())
-                papers_meta.append(temp[0])
-            except Exception as e:
-                 print(e)
-                 print(_id)
-     
-        print('Something went wrong during queries. {0}% of articles is missing'.format(int(100*(1-len(papers_meta)/len(id_list)))))
-        print('[Debug] ID_list length: {0}, Query length: {1}'.format(len(id_list),len(papers_meta)))
-        print(f'Queried: {list(map(lambda x: x.entry_id.split("/")[-1],papers_meta))}\nFull: {id_list}')
-        print('Adding to exiting database...', end=' ')
-        local_db = {}
-        for idx,meta_info in enumerate(papers_meta):
-            temp_dict = {}
-            temp_dict['authors'] = list(map(str, meta_info.authors))
-            temp_dict['title'] = self._correct_article_title(meta_info)
-            temp_dict['pdf_url'] = meta_info.pdf_url
-            temp_dict['date'] = meta_info.published
-            local_db[id_list[idx]] = temp_dict
-        self.db = {**self.db, **local_db}
-        print('Done.')
-        self._save_db()
-        del local_db          
-            
-        
-    def _save_db(self):
-        path_to_check, filename = os.path.split(self.db_path)
-        if path_to_check:
-            os.makedirs(path_to_check, exist_ok=True)
-        db_file = open(self.db_path, 'wb')
-        pickle.dump(self.db, db_file, 2)
-        db_file.close()
-        self.empty_db_flag = not bool(self.db)
-        print('Database was saved in ',self.db_path)
-
-    def _correct_article_title(self,query):
-        title = query.title
-        title = title.replace(':', '.')
-        title = title.replace('\t', ' ')
+    @property
+    def to_filename(self) -> str:
+        name: str = self.aid
+        if self.version is not None: name = f'{name}v{self.version}'
+        title: str = self.title.replace(':', '.')
+        title = title.replace('\t', ' ').replace('/', ' ')
         title = title.replace('\n', '')
-        title = title.replace('/', ' ')
-        return title[:-1] if title[-1] == '.' else title
+        title = title.removesuffix('.')
+        authors: str = _pretty_authors_str(self.authors)
+        return f'[{name}] {authors} {title}'
 
-    def _extract_date(self,query,need_version=True):
-        year = time.strftime('%Y',query['date'])
-        version = 'v'
-        dot_pos = query['pdf_url'].rfind('.')
-        v_pos = query['pdf_url'].rfind('v')
-        if v_pos > dot_pos:
-            version += query['pdf_url'][v_pos+1]
-        else:
-            version += '1'
-        return '(' + year + (version if need_version else '') +'). '
+#####################################################################
+#########################     MAIN     ##############################
+
+class ArxivLib():
+    def __init__(self, db_path: Path | str = THISPATH / 'arxiv_db.json', 
+                 n_ids_in_request: int = 10) -> None:
+        if isinstance(db_path, str): db_path = Path(db_path).expanduser().resolve()
+        self._db: dict[str, PrePrint] = dict()
+        if db_path.suffix != '.json': raise ValueError('Database should be in JSON format')
+        if db_path.exists():
+            self._db: Container[PrePrint] = PrePrint.from_json_file(db_path)
+            self._db = dict(zip(map(lambda a: a.aid, self._db), self._db))
+        self._arxiv_pattern: Pattern = re.compile(
+            r"^(?:.*arxiv\.org\/(?:(?:abs)|(?:pdf))\/)?(?P<id>\d{4}\.\d{5})(?:v(?P<ver>\d{1,}))?$"
+        )
+        self._client: Client = Client()
+        self._n_ids_in_request: int = n_ids_in_request
+        print(f'{len(self._db)} entries loaded from DB: {db_path}')
+
+    def add_from_old_db(self, db_path: Path | str) -> None:
+        if isinstance(db_path, str): db_path = Path(db_path).expanduser().resolve()
+        with db_path.open('rb') as db_data: 
+            old_db: dict[str, Any] = pickle.load(db_data)
+        self.add_by_id(ids=list(old_db.keys()))
+
+    def add_by_url(self, urls: list[str]) -> None:
+        def _extract_uid(url: str) -> str | None:
+            mb_uid: Match | None = self._arxiv_pattern.fullmatch(url)
+            if mb_uid is None: return None
+            return mb_uid.group("id")
+        self.add_by_id(ids=list(filter(None, map(_extract_uid, urls))))
+
+    def _execute_requests(self, ids: list[str]) -> None:
+        chunks: Iterable[Search] = map(lambda chunk: Search(id_list=chunk), 
+                                       list_chunk(ids, self._n_ids_in_request))
+        preprints: list[PrePrint] = list()
+        with tqdm(chunks, total=len(ids), desc='Performing requests...') as pbar:
+            for search in pbar:
+                n_actual: int = 0
+                for res in self._client.results(search):
+                    preprints.append(PrePrint.from_arxiv_result(res))
+                    n_actual += 1
+                pbar.update(n_actual)
+        preprints=sorted(preprints, key=lambda pp: pp.published)
+        preprints: dict[str, PrePrint] = dict(zip(map(lambda pp: pp.aid, preprints),
+                                                      preprints))
+        print(f'{len(preprints)} preprints\' meta obtained . DB will updated')
+        self._db.update(preprints)
+
+    def _save_db(self, db_path: Path = THISPATH / 'arxiv_db.json') -> None:
+        Container[PrePrint](self._db.values()).to_json_file(db_path)
     
-    def _standartize_author(self,str_):
-        def get_capital_indices(s):
-            return [i for i, c in enumerate(s) if c.isupper()]
-        surname = str_[str_.rfind(" ") + 1:]
-        first_capital_letter = get_capital_indices(str_)[0]
-        return surname + ', ' + str_[first_capital_letter]+'.'
-        
-    def _extract_authors(self,query):
-        authors_list = query['authors']
-        authors_string = ''
-        for i,author in enumerate(authors_list):
-            if i < 2:
-                authors_string += self._standartize_author(author) + ', '
-            else:
-                authors_string += self._standartize_author(authors_list[-1]) + ', etc. '
-                break
-        return authors_string        
-            
-        
-    def prepare_for_download(self):
-        if self.empty_db_flag:
-            print('Database is empty! Cannot download anything!')
+    def add_by_id(self, ids: list[str]) -> list[str]:
+        n_ids: int = len(ids)
+        ids = list(
+            filter(
+                lambda i: i not in self._db,
+                map(lambda m: m.group("id"),
+                    filter(None,
+                           map(lambda i: PrePrint.id_pattern.fullmatch(i),
+                               ids)
+                    )
+                )
+            )
+        )
+        if not len(ids): return
+        print(f'{len(ids)} entries will added to DB')
+        if diff := (n_ids - len(ids)): print(f'{diff} entries already known.')
+        self._execute_requests(ids=ids)
+        self._save_db()
+        return ids
+
+    def update_db(self) -> None:
+        if not self._db:
+            print('DB is empty nothing to update!')
+            return
+        self._execute_requests(ids=list(self._db.keys()))
+        self._save_db()
+
+    def download_pdfs(self, folder: Path | str,
+                      ids: list[str] = None,
+                      check_exist: bool = True) -> None:
+        if isinstance(folder, str): folder = Path(folder).expanduser().resolve()
+        folder.mkdir(exist_ok=True, parents=True)
+        ex_pdfs: set[str] = set()
+        def _parse(x: str) -> tuple[str, int | None] | None:
+            parsed: Match = PrePrint.id_pattern.fullmatch(x)
+            if parsed is None: return None
+            return parsed.group('id'), _mb_int(parsed.group('ver'))
+        if check_exist: 
+            ex_pdfs = set(filter(None,
+                (_parse(p.stem) for p in folder.iterdir() if p.suffix == '.pdf')))
+        to_download: list[PrePrint] 
+        if ids is not None:
+            ids = self.add_by_id(ids=ids)
+            to_download = [pp for pp in map(lambda idx: self._db[idx], ids)\
+                           if (pp.aid, pp.version) not in ex_pdfs]
         else:
-            print('Checking download path...')
-            dir_stamp = os.listdir(self.download_path)
-            existing_articles = [elem for elem in dir_stamp  if '.pdf' in elem]
-            if existing_articles:
-                existing_articles = [(elem[elem.find(').')+3:-4],'v'+elem[elem.find(').')-1]) for elem in existing_articles]
-            self.to_download = []
-            print('[Debug] Existing articles number: ',len(existing_articles))
-            print('Checking existing articles on coincidence...')
-            for key,elem in tqdm.tqdm(self.db.items()):
-                flag = True
-                for i,title in enumerate(existing_articles):
-                    if distance(title[0],elem['title']) < 5:
-                        flag = False
-                        version = elem['pdf_url'][elem['pdf_url'].rfind('v') + 1:]
-                        flag = title[1][1:] != version and version.isdigit() and title[1][1:].isdigit()
-                        #delete old version
-                        if flag:
-                            print('Article: ',title[0], ' - old version:',title[1][1:],', new version: ',version)
-                            target_fn = dir_stamp[i]
-                            os.remove(os.path.join(self.download_path,target_fn))
-                            break
-                if flag:
-                    self.to_download.append({'pdf_url':elem['pdf_url'], 
-                                        'title':self._extract_authors(elem)+self._extract_date(elem)+elem['title']})
-            print('Checking finished. {0} articles ready for download!'.format(len(self.to_download)))
-            
-    def download(self,slugify,reload_download_list=False):
-        if reload_download_list:
-            self.prepare_for_download()
-        if not self.to_download:
-            print('Download list is empty. Trying to reload.')
-            self.prepare_for_download()
-            self.download()
-        else:
-            print('Download started...')
-            for elem in tqdm.tqdm(self.to_download):
-                try:
-                    arxiv.download(elem,slugify=slugify, dirpath=self.download_path)
-                except:
-                    print('Something went wrong during downloading {0} by url {1}. Passed'.format(elem['title'],
-                                                                                          elem['pdf_url']))    
-            print('Download finished!')
+            to_download: list[PrePrint] = [pp for pp in self._db.values()\
+                                           if (pp.aid, pp.version) not in ex_pdfs]
+        n: int = len(to_download)
+        failed: list[str] = list()
+        for pp in tqdm(to_download, total=n, desc="Downloading..."):
+            name: Path = folder / f'{pp.to_filename}.pdf'
+            try: urlretrieve(pp.url, name)
+            except: failed.append(pp.aid)
+        print(f'Done. {n - len(failed)}/{n} downloaded!')
+        if failed: print(f'Details:\n{failed}')
 
-            
-            
+#####################################################################
+#########################     CLI     ###############################
 
+@click.command(name='update')
+@click.pass_context
+def update(ctx: click.Context) -> None:
+    ArxivLib(db_path=ctx.obj['db_path'],
+             n_ids_in_request=ctx.obj['n_ids_in_request']).update_db()
 
-            
-            
+@click.command(name='download')
+@click.option('-s', '--save-path',
+              type=click.Path(file_okay=False,
+                              resolve_path=True,
+                              path_type=Path),
+              required=True,
+              help='Path where requested PDFs will be saved')
+@click.option('-a', '--article',
+              type=str, default=None, multiple=True,
+              help='ID of article to download. Can accept multiple options'
+              )
+@click.pass_context
+def download(ctx: click.Context,
+             save_path: Path,
+             article: tuple[str, ...]) -> None:
+    lib = ArxivLib(db_path=ctx.obj['db_path'],
+                   n_ids_in_request=ctx.obj['n_ids_in_request'])
+    if not article: article = None
+    else: article = list(article)
+    lib.download_pdfs(folder=save_path, ids=article)
+
+@click.command(name='add')
+@click.option('-a', '--article',
+              type=str, default=None, multiple=True,
+              help='ID of article to download. Can accept multiple options'
+              )
+@click.pass_context
+def add(ctx: click.Context,
+        ids: list[str]) -> None:
+    if not ids: ids = None
+    else: ids = list(ids)
+    ArxivLib(db_path=ctx.obj['db_path'],
+             n_ids_in_request=ctx.obj['n_ids_in_request']).add_by_id(ids=ids)
+    pass
+
+@click.command(name='from-Pocket')
+@click.option('-f', '--file',
+              type=click.Path(exists=True,
+                              dir_okay=False,
+                              resolve_path=True,
+                              path_type=Path),
+              required=True,
+              help='CSV file obtained from https://getpocket.com/export')
+@click.pass_context
+def add_from_pocket(ctx: click.Context,
+                    file: Path) -> None:
+    lib = ArxivLib(db_path=ctx.obj['db_path'],
+                   n_ids_in_request=ctx.obj['n_ids_in_request'])
+    urls: list[str] = list()
+    with file.open('r') as icsv:
+        for row in csv.DictReader(icsv): urls.append(row["url"])
+    lib.add_by_url(urls)
+
+@click.command(name='from-file')
+@click.option('-f', '--file',
+              type=click.Path(exists=True,
+                              dir_okay=False,
+                              resolve_path=True,
+                              path_type=Path),
+              required=True,
+              help='Any plain text file with preprint IDs insidem via separator')
+@click.option('--sep', type=str,
+              default=',', show_default=True,
+              help='IDs separator inside file')
+@click.pass_context
+def add_from_file(ctx: click.Context,
+                  file: Path,
+                  sep: str) -> None:
+    lib = ArxivLib(db_path=ctx.obj['db_path'],
+                   n_ids_in_request=ctx.obj['n_ids_in_request'])
+    text: str = file.read_text.rstrip('\n')
+    ids: list[str] = list(map(lambda s: s.strip(' '), text.split(sep)))
+    lib.add_by_id(ids)
+
+@click.group()
+@click.option('-d', '--db-path',
+              type=click.Path(dir_okay=False,
+                              resolve_path=True,
+                              path_type=Path),
+              default=THISPATH / 'arxiv_db.json',
+              show_default=True,
+              help='Path to DB in JSON file.')
+@click.option('--n-ids-in-request', type=int,
+              default=10,
+              show_default=True,
+              help="Defines how many preprints ids will be send in single request to arxiv.org\n"\
+                   "Number of requests depends on number of preprints devided on this value.!")
+@click.pass_context
+def cli(ctx: click.Context,
+        db_path: Path,
+        n_ids_in_request: int) -> None:
+    ctx.ensure_object(dict)
+    ctx.obj['db_path'] = db_path
+    ctx.obj['n_ids_in_request'] = n_ids_in_request
+    pass
+
+cli.add_command(update)
+cli.add_command(download)
+cli.add_command(add)
+cli.add_command(add_from_pocket)
+cli.add_command(add_from_file)
+
+if __name__ == '__main__':  cli()
