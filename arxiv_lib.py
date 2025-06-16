@@ -130,7 +130,7 @@ class ArxivLib():
     
     def add_by_id(self, ids: list[str]) -> list[str]:
         n_ids: int = len(ids)
-        ids = list(
+        _ids: list[str] | None = list(
             filter(
                 lambda i: i not in self._db,
                 map(lambda m: m.group("id"),
@@ -141,10 +141,10 @@ class ArxivLib():
                 )
             )
         )
-        if not len(ids): return
+        if not len(_ids): return ids
         print(f'{len(ids)} entries will added to DB')
-        if diff := (n_ids - len(ids)): print(f'{diff} entries already known.')
-        self._execute_requests(ids=ids)
+        if diff := (n_ids - len(_ids)): print(f'{diff} entries already known.')
+        self._execute_requests(ids=_ids)
         self._save_db()
         return ids
 
@@ -264,8 +264,8 @@ def add_from_file(ctx: click.Context,
                   sep: str) -> None:
     lib = ArxivLib(db_path=ctx.obj['db_path'],
                    n_ids_in_request=ctx.obj['n_ids_in_request'])
-    text: str = file.read_text.rstrip('\n')
-    ids: list[str] = list(map(lambda s: s.strip(' '), text.split(sep)))
+    text: str = file.read_text().rstrip('\n')
+    ids: list[str] = list(map(lambda s: s.strip(' ').strip('\''), text.split(sep)))
     lib.add_by_id(ids)
 
 @click.group()
@@ -289,6 +289,11 @@ def cli(ctx: click.Context,
     ctx.obj['db_path'] = db_path
     ctx.obj['n_ids_in_request'] = n_ids_in_request
     pass
+
+# TODO: Remove from DB
+def remove() -> None: pass
+# TODO: Pretty print
+def show() -> None: pass
 
 cli.add_command(update)
 cli.add_command(download)
