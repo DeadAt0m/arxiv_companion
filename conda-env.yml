@@ -1,8 +1,10 @@
+name: arxiv
 channels:
    - conda-forge
-dependenices:
-   - python==3.11
+dependencies:
+   - python==3.12
    - click
    - tqdm
    - arxiv
-   - dataclass_wizard
+   - requests
+   - dataclass-wizard
