@@ -1,0 +1,244 @@
+services:
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    command:
+      - "--log.level=ERROR"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=${MAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    restart: always
+    depends_on:
+      - miniflux
+      - shiori
+      - github-redirect
+      - gossa
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./letsencrypt:/letsencrypt"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - traefik-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.nonwww-redirect.redirectregex.regex=^https?://(?:www\\.)?(.+)"
+      - "traefik.http.middlewares.nonwww-redirect.redirectregex.replacement=https://$${1}"
+      - "traefik.http.middlewares.nonwww-redirect.redirectregex.permanent=true"
+   
+  github-redirect:
+    image: traefik/whoami:latest
+    container_name: github-redirect
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    restart: always
+    networks:
+      - traefik-net
+    command:
+      - "--port=8081"
+    expose:
+      - 8081
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.github-redirect.rule=(Host(`${BASE_URL}`) || Host(`www.${BASE_URL}`)) && PathPrefix(`/`)"
+      - "traefik.http.routers.github-redirect.entrypoints=websecure"
+      - "traefik.http.routers.github-redirect.priority=1"
+      - "traefik.http.routers.github-redirect.middlewares=nonwww-redirect,to-github"
+      - "traefik.http.routers.github-redirect.service=noop@internal"
+      - "traefik.http.middlewares.to-github.redirectregex.regex=^(.*)"
+      - "traefik.http.middlewares.to-github.redirectregex.replacement=${GITHUB}"
+      - "traefik.http.middlewares.to-github.redirectregex.permanent=false"
+      - "traefik.http.routers.github-redirect.tls.certresolver=myresolver"
+      - "traefik.http.services.github-redirect.loadbalancer.server.port=8081"
+      - "traefik.docker.network=traefik-net"
+
+  miniflux:
+    image: miniflux/miniflux:latest
+    container_name: miniflux
+    depends_on:
+      miniflux-postgres:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    restart: always
+    expose:
+      - 8082
+    env_file:
+      - ./config/miniflux.env
+    networks:
+      - traefik-net
+      - miniflux-net
+    environment:
+      - PORT=8082
+      - BASE_URL=https://${BASE_URL}/rss
+      - ADMIN_USERNAME=${USERNAME}
+      - ADMIN_PASSWORD=${PASSWORD}
+      - RUN_MIGRATIONS=1
+      - CREATE_ADMIN=1
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.miniflux.rule=(Host(`${BASE_URL}`) || Host(`www.${BASE_URL}`)) && PathPrefix(`/rss`)"
+      - "traefik.http.routers.miniflux.entrypoints=websecure"
+      - "traefik.http.routers.miniflux.priority=13"
+      - "traefik.http.routers.miniflux.tls.certresolver=myresolver"
+      - "traefik.http.routers.miniflux.middlewares=nonwww-redirect"
+      - "traefik.http.services.miniflux.loadbalancer.server.port=8082"
+      - "traefik.docker.network=traefik-net"
+  
+  shiori:
+    image: ghcr.io/go-shiori/shiori:latest
+    container_name: shiori
+    depends_on:
+      shiori-postgres:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    restart: always
+    expose:
+      - 8083
+    env_file:
+      - ./config/shiori.env
+    networks:
+      - traefik-net
+      - shiori-net
+    environment:
+      - SHIORI_HTTP_PORT=8083
+      - SHIORI_HTTP_ROOT_PATH=/arxiv/
+      - SHIORI_HTTP_SECRET_KEY=${HASHPASSWD}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.shiori.rule=(Host(`${BASE_URL}`) || Host(`www.${BASE_URL}`)) && PathPrefix(`/arxiv`)"
+      - "traefik.http.routers.shiori.entrypoints=websecure"
+      - "traefik.http.routers.shiori.priority=12"
+      - "traefik.http.routers.shiori.tls.certresolver=myresolver"
+      - "traefik.http.routers.shiori.middlewares=nonwww-redirect,strip-shiori-prefix"
+      - "traefik.http.middlewares.strip-shiori-prefix.stripprefix.prefixes=/arxiv" 
+      - "traefik.http.services.shiori.loadbalancer.server.port=8083"
+      - "traefik.docker.network=traefik-net"
+ 
+  gossa:
+    image: pldubouilh/gossa:latest
+    container_name: gossa
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    restart: always
+    read_only: true
+    user: "1000:1000"
+    userns_mode: "keep-id" 
+    expose:
+      - 8084
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+    healthcheck:
+      disable: true
+    volumes:
+      - articles-folder:/shared
+    networks:
+      - traefik-net
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8084
+      - PREFIX=/lib/
+      - FOLLOW_SYMLINKS=false
+      - SKIP_HIDDEN_FILES=true
+      - DATADIR=/shared
+      - READONLY=true
+      - VERB=true
+      - UID=1000 # this should match the user set above
+      - GID=1000 # this should match the user's group
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gossa.rule=(Host(`${BASE_URL}`) || Host(`www.${BASE_URL}`)) && PathPrefix(`/lib`)"
+      - "traefik.http.routers.gossa.entrypoints=websecure"
+      - "traefik.http.routers.gossa.priority=11"
+      - "traefik.http.routers.gossa.tls.certresolver=myresolver"
+      - "traefik.http.routers.gossa.middlewares=nonwww-redirect,myauth"
+      - "traefik.http.middlewares.myauth.basicAuth.users=${USERNAME}:${HASHPASSWD}"
+      - "traefik.http.services.gossa.loadbalancer.server.port=8084"
+      - "traefik.docker.network=traefik-net"
+
+  miniflux-postgres:
+    image: postgres:latest
+    container_name: miniflux-postgres
+    env_file:
+      - ./config/miniflux.env
+    environment:
+      - POSTGRES_DB=miniflux
+    restart: always
+    networks:
+      - miniflux-net
+    volumes:
+      - miniflux-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "miniflux"]
+      interval: 10s
+      start_period: 30s
+
+  shiori-postgres:
+    image: postgres:latest
+    container_name: shiori-postgres
+    env_file:
+      - ./config/shiori.env
+    environment:
+      - POSTGRES_DB=shiori
+    restart: always
+    networks:
+      - shiori-net
+    volumes:
+      - shiori-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "shiori"]
+      interval: 10s
+      start_period: 30s
+
+
+networks:
+  traefik-net:
+    name: traefik-net
+  miniflux-net:
+    name: miniflux-net
+  shiori-net:
+    name: shiori-net
+
+volumes:
+  miniflux-db:
+    name: "miniflux-db"
+    driver: local
+    driver_opts:
+       type: none
+       o: bind
+       device: ${DB_STORAGE}/miniflux
+
+  shiori-db:
+    name: "shiori-db"
+    driver: local
+    driver_opts:
+       type: none
+       o: bind
+       device: ${DB_STORAGE}/shiori
+
+  articles-folder:
+    name: "articles-folder"
+    driver: local
+    driver_opts:
+       type: none
+       o: bind
+       device: ${ARTICLES_SHARE_FOLDER}
